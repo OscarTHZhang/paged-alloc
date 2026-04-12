@@ -1,0 +1,31 @@
+[package]
+name = "paged-alloc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+mimalloc = { version = "0.1", default-features = false }
+
+[[bench]]
+name = "alloc"
+harness = false
+
+# `cargo bench` uses this profile. Defaults already set opt-level = 3,
+# debug-assertions = off, overflow-checks = off; we add LTO and a single
+# codegen unit so cross-crate inlining (including into criterion's
+# harness) matches what a production release build would see.
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+
+# Mirror the same settings for `cargo build --release` so downstream
+# users who build in release see numbers consistent with the bench.
+[profile.release]
+lto = "thin"
+codegen-units = 1
