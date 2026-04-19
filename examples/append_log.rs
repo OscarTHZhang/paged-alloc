@@ -57,8 +57,6 @@ fn main() {
             let mut pool = ChunkPool::with_capacity(page_size, prewarm_pages);
             let mut lsn = 0u64;
             let mut rng = 0xC6BC279692B5C323u64;
-            let max_size = avg_record_size + record_size_jitter;
-            let mut payload = vec![0u8; max_size];
             let writer_start = Instant::now();
 
             while running.load(Ordering::Relaxed) {
@@ -66,12 +64,14 @@ fn main() {
                 let size = avg_record_size
                     - record_size_jitter
                     + (rng as usize % (2 * record_size_jitter + 1));
-                // Fill the payload with an lsn-dependent pattern.
-                for (i, b) in payload[..size].iter_mut().enumerate() {
-                    *b = ((i as u64) ^ lsn) as u8;
-                }
-                // alloc_from copies payload[..size] into a fresh chunk.
-                let chunk = pool.alloc_from(&tenant, &payload[..size]);
+                // Fill the chunk in place with an lsn-dependent pattern.
+                // `alloc_with` takes care of allocate + seal in one call,
+                // so there is no intermediate payload buffer.
+                let chunk = pool.alloc_with(&tenant, size, |buf| {
+                    for (i, b) in buf.iter_mut().enumerate() {
+                        *b = ((i as u64) ^ lsn) as u8;
+                    }
+                });
                 // Publish into the log. A write lock serializes with
                 // concurrent readers' BTreeMap::get calls.
                 log.write().unwrap().insert(lsn, chunk);

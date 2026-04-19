@@ -331,6 +331,84 @@ impl ChunkPool {
         b.seal()
     }
 
+    /// Allocates `size` bytes, runs `init` on the writable buffer,
+    /// seals, and returns the resulting [`Chunk`]. The chunk's
+    /// logical length is always `size`.
+    ///
+    /// This is a one-call shorthand for the common pattern:
+    /// `allocate → as_mut_slice / fill → set_len(size) → seal`.
+    ///
+    /// # Panic safety
+    /// If `init` panics, the underlying `ChunkBuilder` is dropped,
+    /// which releases the tenant's accounting for the attempted
+    /// allocation. Subsequent allocations continue to work.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use paged_alloc::{ChunkPool, Tenant};
+    ///
+    /// let mut pool = ChunkPool::new();
+    /// let tenant = Tenant::new("t");
+    /// let chunk = pool.alloc_with(&tenant, 4, |buf| {
+    ///     buf[0] = 0xDE;
+    ///     buf[1] = 0xAD;
+    ///     buf[2] = 0xBE;
+    ///     buf[3] = 0xEF;
+    /// });
+    /// assert_eq!(&chunk[..], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    /// ```
+    pub fn alloc_with<F>(&mut self, tenant: &Tenant, size: usize, init: F) -> Chunk
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        let mut b = self.allocate(tenant, size);
+        init(b.as_mut_slice());
+        b.set_len(size);
+        b.seal()
+    }
+
+    /// Allocates `capacity` bytes, runs `init` on the writable
+    /// buffer, and seals the result with the logical length returned
+    /// by `init`. Use this when the final length of the record is
+    /// determined while filling it (e.g. serialization whose size
+    /// depends on content).
+    ///
+    /// # Panics
+    /// Panics if `init` returns a value greater than `capacity`.
+    ///
+    /// # Panic safety
+    /// If `init` panics, the underlying `ChunkBuilder` is dropped
+    /// and the tenant's accounting for the attempted allocation is
+    /// released.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use paged_alloc::{ChunkPool, Tenant};
+    ///
+    /// let mut pool = ChunkPool::new();
+    /// let tenant = Tenant::new("t");
+    /// // Reserve up to 32 bytes; serialize "hi!" and return its length.
+    /// let chunk = pool.alloc_with_len(&tenant, 32, |buf| {
+    ///     let msg = b"hi!";
+    ///     buf[..msg.len()].copy_from_slice(msg);
+    ///     msg.len()
+    /// });
+    /// assert_eq!(&chunk[..], b"hi!");
+    /// assert_eq!(chunk.len(), 3);
+    /// assert_eq!(chunk.capacity(), 32);
+    /// ```
+    pub fn alloc_with_len<F>(&mut self, tenant: &Tenant, capacity: usize, init: F) -> Chunk
+    where
+        F: FnOnce(&mut [u8]) -> usize,
+    {
+        let mut b = self.allocate(tenant, capacity);
+        let len = init(b.as_mut_slice());
+        b.set_len(len);
+        b.seal()
+    }
+
     // ---------------------------------------------------------------
     // Dispatch paths
     // ---------------------------------------------------------------

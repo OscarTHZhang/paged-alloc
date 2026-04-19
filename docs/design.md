@@ -1,6 +1,6 @@
 # paged-alloc — Design Note
 
-**Status:** v0.3, living document
+**Status:** v0.3.1, living document
 **Audience:** contributors and users integrating this crate into a thread-per-core database engine
 **Reproducing the numbers:** `scripts/bench.sh` runs the full criterion suite and prints the same tables shown in §10.
 
@@ -111,6 +111,25 @@ std::thread::spawn({ let p = page.clone(); move || { let _ = &p[..]; } })
 drop(page);
 assert_eq!(tenant.stats().pages_in_use(), 0);
 ```
+
+### Convenience allocation APIs
+
+The builder → seal dance is ceremonial for simple cases. Three
+one-call helpers cover the common patterns:
+
+| Use case | Call shape |
+|---|---|
+| Copy a slice in | `pool.alloc_from(&t, &data) -> Chunk` |
+| Fill in a closure (len == size) | `pool.alloc_with(&t, size, \|buf\| { ... }) -> Chunk` |
+| Fill in a closure, closure returns logical length | `pool.alloc_with_len(&t, capacity, \|buf\| -> usize { ... }) -> Chunk` |
+| Multi-step writes with error handling | `let mut b = pool.allocate(&t, cap); b.append(...)?; ...; b.seal()` |
+
+`PagePool` exposes the same four shapes: `allocate`, `alloc_from`,
+`alloc_with`, `alloc_with_len`.
+
+The closures are panic-safe: if `init` panics, the underlying
+builder drops, which recycles the buffer back to the pool and
+releases tenant accounting for the attempted allocation.
 
 ### Plugging in a different backing source
 
@@ -940,6 +959,27 @@ ownership and lifetime story.)
     (stats/Arc contention).
   - Single-writer pool + lock-free MPSC free list. Pairs with a
     scalable global allocator for near-linear scaling.
+
+- **v0.3.1**
+  - Added closure-based convenience APIs on both `ChunkPool` and
+    `PagePool`: `alloc_with(&tenant, size, |buf| ...)` and
+    `alloc_with_len(&tenant, cap, |buf| -> usize)`. Also added
+    `PagePool::alloc_from` for parity with `ChunkPool`.
+  - These wrap the existing builder → seal flow into a single call,
+    so the common "allocate + fill + seal" pattern is one line
+    instead of 3–6. The builder API stays available for multi-step
+    writes with error propagation across appends. Panic-safe: a
+    closure that panics drops the builder cleanly, recycling its
+    buffer and releasing tenant accounting.
+  - Added `#[must_use]` on `Chunk`, `Page`, `ChunkBuilder`,
+    `PageBuilder` so accidentally dropping an allocated handle is a
+    compile-time warning.
+  - GitHub Actions CI (`cargo test`, `cargo clippy -D warnings`,
+    `cargo doc -D warnings`, MSRV check on 1.87, examples build).
+  - README gained a "Recommended global allocator" section
+    explaining the scaling numbers assume a per-thread-cache
+    allocator (mimalloc / jemalloc).
+  - Removed an unused `capacity` field from internal `PackedPage`.
 
 - **v0.3**
   - Added `ChunkPool`, `ChunkBuilder`, `Chunk`, `ChunkPoolStats`,

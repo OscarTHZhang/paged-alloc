@@ -763,6 +763,135 @@ fn chunk_page_and_chunk_stats_are_independent() {
     assert_eq!(tenant.stats().bytes_in_use(), 4096 + 128);
 }
 
+#[test]
+fn chunk_alloc_with_fills_buffer_and_sets_full_len() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    let chunk = pool.alloc_with(&tenant, 16, |buf| {
+        assert_eq!(buf.len(), 16);
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+    });
+
+    assert_eq!(chunk.len(), 16);
+    assert_eq!(chunk.capacity(), 16);
+    for (i, &b) in chunk.iter().enumerate() {
+        assert_eq!(b, i as u8);
+    }
+    assert_eq!(tenant.stats().chunks_in_use(), 1);
+    assert_eq!(tenant.stats().bytes_in_use(), 16);
+}
+
+#[test]
+fn chunk_alloc_with_len_uses_returned_length() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    let chunk = pool.alloc_with_len(&tenant, 32, |buf| {
+        let msg = b"variable";
+        buf[..msg.len()].copy_from_slice(msg);
+        msg.len()
+    });
+
+    assert_eq!(chunk.len(), 8);
+    assert_eq!(chunk.capacity(), 32);
+    assert_eq!(&chunk[..], b"variable");
+    // Tenant is charged for the requested capacity, not the logical len.
+    assert_eq!(tenant.stats().bytes_in_use(), 32);
+}
+
+#[test]
+#[should_panic(expected = "len 40 > capacity 32")]
+fn chunk_alloc_with_len_panics_if_closure_exceeds_capacity() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+    let _ = pool.alloc_with_len(&tenant, 32, |_| 40);
+}
+
+#[test]
+fn chunk_alloc_with_panic_unwinds_cleanly() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    // A closure that panics in the middle of init. The ChunkBuilder
+    // must drop cleanly: tenant counters must return to 0 and the
+    // underlying buffer must be back in the pool's free list.
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _chunk = pool.alloc_with(&tenant, 64, |buf| {
+            buf[0] = 1;
+            panic!("simulated");
+        });
+    }));
+    assert!(result.is_err());
+
+    assert_eq!(tenant.stats().chunks_in_use(), 0);
+    assert_eq!(tenant.stats().bytes_in_use(), 0);
+    // Pool is still usable: a subsequent allocation should reuse the
+    // recycled buffer from the packed page.
+    let _c = pool.alloc_from(&tenant, &[42u8; 16]);
+    assert_eq!(tenant.stats().chunks_in_use(), 1);
+}
+
+#[test]
+fn chunk_alloc_with_zero_size_calls_closure_with_empty_slice() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+    let chunk = pool.alloc_with(&tenant, 0, |buf| {
+        assert!(buf.is_empty());
+    });
+    assert_eq!(chunk.len(), 0);
+    assert!(chunk.as_slice().is_empty());
+}
+
+#[test]
+fn page_alloc_from_copies_data() {
+    let mut pool = PagePool::new(4096);
+    let tenant = Tenant::new("t");
+    let page = pool.alloc_from(&tenant, b"block 42");
+    assert_eq!(&page[..], b"block 42");
+    assert_eq!(page.len(), 8);
+    assert_eq!(page.capacity(), 4096);
+}
+
+#[test]
+#[should_panic(expected = "data length 5000 exceeds page_size 4096")]
+fn page_alloc_from_panics_on_oversize() {
+    let mut pool = PagePool::new(4096);
+    let tenant = Tenant::new("t");
+    let oversize = vec![0u8; 5000];
+    let _ = pool.alloc_from(&tenant, &oversize);
+}
+
+#[test]
+fn page_alloc_with_fills_whole_page_sets_full_len() {
+    let mut pool = PagePool::new(4096);
+    let tenant = Tenant::new("t");
+    let page = pool.alloc_with(&tenant, |buf| {
+        buf[..5].copy_from_slice(b"hello");
+    });
+    assert_eq!(page.len(), 4096);
+    assert_eq!(page.capacity(), 4096);
+    assert_eq!(&page[..5], b"hello");
+}
+
+#[test]
+fn page_alloc_with_len_uses_returned_length() {
+    let mut pool = PagePool::new(4096);
+    let tenant = Tenant::new("t");
+    let page = pool.alloc_with_len(&tenant, |buf| {
+        let msg = b"short";
+        buf[..msg.len()].copy_from_slice(msg);
+        msg.len()
+    });
+    assert_eq!(page.len(), 5);
+    assert_eq!(page.capacity(), 4096);
+    assert_eq!(&page[..], b"short");
+}
+
 // =========================================================================
 // End ChunkPool tests
 // =========================================================================

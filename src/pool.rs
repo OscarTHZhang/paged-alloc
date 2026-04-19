@@ -3,7 +3,7 @@ use std::ptr::{self, NonNull, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
-use crate::page::PageBuilder;
+use crate::page::{Page, PageBuilder};
 use crate::source::{HeapSource, PageSource};
 use crate::tenant::Tenant;
 
@@ -332,6 +332,93 @@ impl PagePool {
         let (buf, shared) = self.allocate_raw_page();
         tenant.stats().record_allocate(shared.page_size as u64);
         PageBuilder::new(buf, shared, tenant.stats_arc())
+    }
+
+    /// Allocates a fresh page, copies `data` into it, seals, and
+    /// returns the [`Page`]. The resulting page's logical length is
+    /// `data.len()`.
+    ///
+    /// # Panics
+    /// Panics if `data.len() > page_size()` — a page cannot hold
+    /// more bytes than its configured size.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use paged_alloc::{PagePool, Tenant};
+    ///
+    /// let mut pool = PagePool::new(4096);
+    /// let tenant = Tenant::new("t");
+    /// let page = pool.alloc_from(&tenant, b"hello");
+    /// assert_eq!(&page[..], b"hello");
+    /// ```
+    pub fn alloc_from(&mut self, tenant: &Tenant, data: &[u8]) -> Page {
+        assert!(
+            data.len() <= self.shared.page_size,
+            "data length {} exceeds page_size {}",
+            data.len(),
+            self.shared.page_size
+        );
+        let mut b = self.allocate(tenant);
+        if !data.is_empty() {
+            b.as_mut_slice()[..data.len()].copy_from_slice(data);
+            b.set_len(data.len());
+        }
+        b.seal()
+    }
+
+    /// Allocates a fresh page, runs `init` on the full mutable
+    /// buffer, seals with `len == page_size()`, and returns the
+    /// resulting [`Page`].
+    ///
+    /// # Panic safety
+    /// If `init` panics, the underlying `PageBuilder` drops,
+    /// recycling its buffer and releasing the tenant's accounting.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use paged_alloc::{PagePool, Tenant};
+    ///
+    /// let mut pool = PagePool::new(4096);
+    /// let tenant = Tenant::new("t");
+    /// let page = pool.alloc_with(&tenant, |buf| {
+    ///     buf[..6].copy_from_slice(b"header");
+    ///     buf[6..9].copy_from_slice(&[0, 0, 0]);
+    /// });
+    /// assert_eq!(&page[..6], b"header");
+    /// assert_eq!(page.len(), 4096);
+    /// ```
+    pub fn alloc_with<F>(&mut self, tenant: &Tenant, init: F) -> Page
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        let mut b = self.allocate(tenant);
+        init(b.as_mut_slice());
+        let cap = b.capacity();
+        b.set_len(cap);
+        b.seal()
+    }
+
+    /// Allocates a fresh page, runs `init` on the full mutable
+    /// buffer, and seals the result with the logical length returned
+    /// by `init`. Use this when the record's size is determined by
+    /// its contents.
+    ///
+    /// # Panics
+    /// Panics if `init` returns a value greater than `page_size()`.
+    ///
+    /// # Panic safety
+    /// If `init` panics, the underlying `PageBuilder` drops,
+    /// recycling its buffer and releasing the tenant's accounting.
+    pub fn alloc_with_len<F>(&mut self, tenant: &Tenant, init: F) -> Page
+    where
+        F: FnOnce(&mut [u8]) -> usize,
+    {
+        let mut b = self.allocate(tenant);
+        let len = init(b.as_mut_slice());
+        b.set_len(len);
+        b.seal()
     }
 
     /// Allocates one raw page without wrapping in [`PageBuilder`] and

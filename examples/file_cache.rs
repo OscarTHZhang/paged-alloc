@@ -53,17 +53,15 @@ fn main() {
         rng = lcg(rng);
         let size =
             avg_file_size - file_size_jitter + (rng as usize % (2 * file_size_jitter + 1));
-        let mut b = pool.allocate(&tenant, size);
-        // Fill with a deterministic pattern so reader checksums are
-        // meaningful and the optimizer can't elide the loads.
-        {
-            let slice = b.as_mut_slice();
-            for (i, byte) in slice.iter_mut().enumerate() {
+        // Allocate + fill + seal in one call. The closure writes a
+        // deterministic pattern so reader checksums are meaningful
+        // and the optimizer cannot elide the loads.
+        let chunk = pool.alloc_with(&tenant, size, |buf| {
+            for (i, byte) in buf.iter_mut().enumerate() {
                 *byte = ((i as u64) ^ id) as u8;
             }
-        }
-        b.set_len(size);
-        cache.insert(id, b.seal());
+        });
+        cache.insert(id, chunk);
     }
     let populate_elapsed = populate_start.elapsed();
     let total_bytes = tenant.stats().bytes_in_use();

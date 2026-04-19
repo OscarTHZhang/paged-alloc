@@ -25,19 +25,51 @@
 //!
 //! # Short example
 //!
+//! The one-call form, for the common "I have bytes, store them" case:
+//!
 //! ```
 //! use paged_alloc::{ChunkPool, Tenant};
 //!
 //! let mut pool = ChunkPool::new();
 //! let tenant = Tenant::new("file-cache");
 //!
-//! let mut builder = pool.allocate(&tenant, 11);
-//! builder.append(b"hello world").unwrap();
-//! let chunk = builder.seal();
-//!
+//! let chunk = pool.alloc_from(&tenant, b"hello world");
 //! assert_eq!(&chunk[..], b"hello world");
 //! assert_eq!(tenant.stats().bytes_in_use(), 11);
 //! ```
+//!
+//! The closure form, for composing records in place:
+//!
+//! ```
+//! # use paged_alloc::{ChunkPool, Tenant};
+//! # let mut pool = ChunkPool::new();
+//! # let tenant = Tenant::new("t");
+//! let record = pool.alloc_with(&tenant, 16, |buf| {
+//!     buf[..6].copy_from_slice(b"header");
+//!     buf[6..16].fill(0);
+//! });
+//! assert_eq!(&record[..6], b"header");
+//! ```
+//!
+//! The builder form, for multi-step writes with error handling or
+//! conditional bailout:
+//!
+//! ```
+//! # use paged_alloc::{ChunkPool, Tenant};
+//! # let mut pool = ChunkPool::new();
+//! # let tenant = Tenant::new("t");
+//! let mut b = pool.allocate(&tenant, 32);
+//! b.append(b"[").unwrap();
+//! b.append(b"payload").unwrap();
+//! b.append(b"]").unwrap();
+//! let chunk = b.seal();
+//! assert_eq!(&chunk[..], b"[payload]");
+//! ```
+//!
+//! None of the forms require an explicit `drop` — when the `Chunk`
+//! (or a `Page`) goes out of scope, or the last `Clone` of it drops,
+//! Rust's RAII returns the buffer to the pool and decrements tenant
+//! counters.
 //!
 //! # Features
 //!
