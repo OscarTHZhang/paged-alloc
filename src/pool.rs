@@ -435,7 +435,10 @@ impl PagePool {
             .pop_local()
             .or_else(|| self.drain_return_queue())
             .unwrap_or_else(|| self.allocate_fresh());
-        self.shared.stats.pages_in_use.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .stats
+            .pages_in_use
+            .fetch_add(1, Ordering::Relaxed);
         (buf, self.shared.clone())
     }
 
@@ -491,9 +494,7 @@ impl Drop for PagePool {
             self.local_head = next;
             // SAFETY: `head` came from `self.shared.source.allocate`.
             unsafe {
-                self.shared
-                    .source
-                    .release(NonNull::new_unchecked(head));
+                self.shared.source.release(NonNull::new_unchecked(head));
             }
         }
     }

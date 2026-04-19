@@ -41,8 +41,7 @@ fn main() {
     let prewarm_pages: usize = 2048;
 
     // ----- Shared state --------------------------------------------------
-    let log: Arc<RwLock<BTreeMap<Lsn, Chunk>>> =
-        Arc::new(RwLock::new(BTreeMap::new()));
+    let log: Arc<RwLock<BTreeMap<Lsn, Chunk>>> = Arc::new(RwLock::new(BTreeMap::new()));
     let high_water = Arc::new(AtomicU64::new(0));
     let running = Arc::new(AtomicBool::new(true));
     let tenant = Tenant::new("log");
@@ -61,8 +60,7 @@ fn main() {
 
             while running.load(Ordering::Relaxed) {
                 rng = lcg(rng);
-                let size = avg_record_size
-                    - record_size_jitter
+                let size = avg_record_size - record_size_jitter
                     + (rng as usize % (2 * record_size_jitter + 1));
                 // Fill the chunk in place with an lsn-dependent pattern.
                 // `alloc_with` takes care of allocate + seal in one call,
@@ -122,8 +120,7 @@ fn main() {
                     rng = lcg(rng);
                     // Target an LSN uniformly over [0, hw).
                     let target = rng % hw;
-                    let chunk: Option<Chunk> =
-                        log.read().unwrap().get(&target).cloned();
+                    let chunk: Option<Chunk> = log.read().unwrap().get(&target).cloned();
                     if let Some(chunk) = chunk {
                         // Read bytes. Integer add prevents elimination.
                         let mut s: u64 = 0;
@@ -151,7 +148,10 @@ fn main() {
     running.store(false, Ordering::Relaxed);
 
     let wr = writer.join().unwrap();
-    let readers: Vec<_> = reader_handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let readers: Vec<_> = reader_handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
 
     // Consume checksum so the reader loops weren't dead code.
     let combined: u64 = readers.iter().fold(0u64, |a, r| a.wrapping_add(r.checksum));
@@ -160,10 +160,7 @@ fn main() {
     // ----- Report --------------------------------------------------------
     let writer_secs = wr.elapsed.as_secs_f64();
     println!("─── writer ────────────────────────────────────────────────");
-    println!(
-        "  Wall clock: {:?}",
-        wr.elapsed
-    );
+    println!("  Wall clock: {:?}", wr.elapsed);
     println!(
         "  Records:    {} ({:.2} M/s)",
         wr.records_written,
@@ -196,7 +193,10 @@ fn main() {
     }
     let reader_secs = max_elapsed.as_secs_f64();
     println!();
-    println!("─── readers ({}) ──────────────────────────────────────────", num_readers);
+    println!(
+        "─── readers ({}) ──────────────────────────────────────────",
+        num_readers
+    );
     println!("  Wall clock:    {:?}", max_elapsed);
     println!(
         "  Aggregate:     {} reads ({:.2} Mreads/s, {:.2} GiB/s)",

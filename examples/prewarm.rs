@@ -13,7 +13,10 @@ const N: usize = 256;
 const CHUNK_SIZE: usize = 4 * 1024;
 
 fn main() {
-    println!("Allocating {} × {} B chunks, timing the first-N window.\n", N, CHUNK_SIZE);
+    println!(
+        "Allocating {} × {} B chunks, timing the first-N window.\n",
+        N, CHUNK_SIZE
+    );
 
     // Cold start: no prewarm. Every allocation hits the source
     // until the free list warms up.
@@ -21,7 +24,10 @@ fn main() {
         let pool = ChunkPool::new();
         (pool, Tenant::new("cold"))
     });
-    println!("  cold (no prewarm):  {:>8} ns / chunk  ({:?} total)", t.per_op, t.total);
+    println!(
+        "  cold (no prewarm):  {:>8} ns / chunk  ({:?} total)",
+        t.per_op, t.total
+    );
 
     // Warm start: prewarm at construction. The first N allocs hit
     // the local free list immediately — no `alloc_zeroed`, no
@@ -30,7 +36,10 @@ fn main() {
         let pool = ChunkPool::with_capacity(16 * 1024, N);
         (pool, Tenant::new("warm"))
     });
-    println!("  prewarmed:          {:>8} ns / chunk  ({:?} total)", t.per_op, t.total);
+    println!(
+        "  prewarmed:          {:>8} ns / chunk  ({:?} total)",
+        t.per_op, t.total
+    );
 }
 
 struct Timing {

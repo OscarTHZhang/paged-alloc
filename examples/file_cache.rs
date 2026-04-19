@@ -46,13 +46,11 @@ fn main() {
     let mut pool = ChunkPool::with_capacity(page_size, prewarm_pages);
     let tenant = Tenant::new("file-cache");
 
-    let mut cache: HashMap<FileId, Chunk> =
-        HashMap::with_capacity(num_files as usize);
+    let mut cache: HashMap<FileId, Chunk> = HashMap::with_capacity(num_files as usize);
     let mut rng = 0x9E3779B97F4A7C15u64;
     for id in 0..num_files {
         rng = lcg(rng);
-        let size =
-            avg_file_size - file_size_jitter + (rng as usize % (2 * file_size_jitter + 1));
+        let size = avg_file_size - file_size_jitter + (rng as usize % (2 * file_size_jitter + 1));
         // Allocate + fill + seal in one call. The closure writes a
         // deterministic pattern so reader checksums are meaningful
         // and the optimizer cannot elide the loads.
@@ -65,10 +63,7 @@ fn main() {
     }
     let populate_elapsed = populate_start.elapsed();
     let total_bytes = tenant.stats().bytes_in_use();
-    println!(
-        "  {} files populated in {:?}",
-        num_files, populate_elapsed
-    );
+    println!("  {} files populated in {:?}", num_files, populate_elapsed);
     println!(
         "  Cache size: {:.2} MiB; chunks in use: {}",
         total_bytes as f64 / (1024.0 * 1024.0),
@@ -87,8 +82,10 @@ fn main() {
 
     // ----- Concurrent readers -------------------------------------------
     println!();
-    println!("─── running {} reader threads × {} reads ──────────────────",
-        num_readers, reads_per_reader);
+    println!(
+        "─── running {} reader threads × {} reads ──────────────────",
+        num_readers, reads_per_reader
+    );
     let start = Instant::now();
     let handles: Vec<_> = (0..num_readers)
         .map(|worker_id| {
@@ -107,8 +104,7 @@ fn main() {
                     // Take a read lock, clone the Chunk, release the
                     // lock, then do the read. This is the pattern
                     // every production file cache uses.
-                    let chunk: Option<Chunk> =
-                        cache.read().unwrap().get(&file_id).cloned();
+                    let chunk: Option<Chunk> = cache.read().unwrap().get(&file_id).cloned();
                     if let Some(chunk) = chunk {
                         // Pretend to do something useful with the bytes.
                         let mut s: u64 = 0;

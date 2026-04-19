@@ -80,10 +80,7 @@ impl TenantStats {
     pub(crate) fn record_allocate(&self, page_bytes: u64) {
         self.total_pages_allocated.fetch_add(1, Ordering::Relaxed);
         self.pages_in_use.fetch_add(1, Ordering::Relaxed);
-        let new_bytes = self
-            .bytes_in_use
-            .fetch_add(page_bytes, Ordering::Relaxed)
-            + page_bytes;
+        let new_bytes = self.bytes_in_use.fetch_add(page_bytes, Ordering::Relaxed) + page_bytes;
         // `record_allocate` is only called from the pool-owning worker
         // thread (allocation path is single-writer), so a plain
         // load-then-store is sufficient for peak tracking. The old
@@ -102,10 +99,7 @@ impl TenantStats {
     pub(crate) fn record_chunk_allocate(&self, chunk_bytes: u64) {
         self.total_chunks_allocated.fetch_add(1, Ordering::Relaxed);
         self.chunks_in_use.fetch_add(1, Ordering::Relaxed);
-        let new_bytes = self
-            .bytes_in_use
-            .fetch_add(chunk_bytes, Ordering::Relaxed)
-            + chunk_bytes;
+        let new_bytes = self.bytes_in_use.fetch_add(chunk_bytes, Ordering::Relaxed) + chunk_bytes;
         if new_bytes > self.peak_bytes_in_use.load(Ordering::Relaxed) {
             self.peak_bytes_in_use.store(new_bytes, Ordering::Relaxed);
         }

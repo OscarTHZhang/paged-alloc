@@ -1,5 +1,10 @@
 # paged-alloc
 
+[![CI](https://github.com/OscarTHZhang/paged-alloc/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/OscarTHZhang/paged-alloc/actions/workflows/ci.yml)
+[![coverage](https://codecov.io/gh/OscarTHZhang/paged-alloc/branch/main/graph/badge.svg)](https://codecov.io/gh/OscarTHZhang/paged-alloc)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![msrv](https://img.shields.io/badge/MSRV-1.87-blue.svg)](https://github.com/OscarTHZhang/paged-alloc/blob/main/Cargo.toml)
+
 A paged memory allocator for thread-per-core database engines.
 
 Designed to back data structures where allocation needs to be instrumented

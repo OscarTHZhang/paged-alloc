@@ -165,11 +165,7 @@ pub unsafe fn madvise_dontneed(ptr: NonNull<u8>, len: usize) -> io::Result<()> {
 fn os_page_size() -> usize {
     // SAFETY: sysconf is thread-safe and takes no pointers.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if size <= 0 {
-        4096
-    } else {
-        size as usize
-    }
+    if size <= 0 { 4096 } else { size as usize }
 }
 
 /// Explicit huge-page-backed [`PageSource`] using

@@ -93,19 +93,15 @@ fn bench_append(c: &mut Criterion) {
     for &chunk in &[16usize, 64, 256, 1024] {
         let payload = vec![0xabu8; chunk];
         group.throughput(Throughput::Bytes(page_size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("chunk_bytes", chunk),
-            &chunk,
-            |b, _| {
-                b.iter(|| {
-                    let mut builder = pool.allocate(&tenant);
-                    while builder.remaining() >= payload.len() {
-                        builder.append(black_box(&payload)).unwrap();
-                    }
-                    drop(black_box(builder.seal()));
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("chunk_bytes", chunk), &chunk, |b, _| {
+            b.iter(|| {
+                let mut builder = pool.allocate(&tenant);
+                while builder.remaining() >= payload.len() {
+                    builder.append(black_box(&payload)).unwrap();
+                }
+                drop(black_box(builder.seal()));
+            });
+        });
     }
     group.finish();
 }
@@ -290,7 +286,9 @@ fn bench_cross_thread_drop(c: &mut Criterion) {
                         .collect();
 
                     let barrier = Arc::new(Barrier::new(droppers + 1));
-                    let mut chunks: Vec<Vec<_>> = (0..droppers).map(|_| Vec::with_capacity(per_dropper)).collect();
+                    let mut chunks: Vec<Vec<_>> = (0..droppers)
+                        .map(|_| Vec::with_capacity(per_dropper))
+                        .collect();
                     for (i, page) in pages.drain(..).enumerate() {
                         chunks[i % droppers].push(page);
                     }

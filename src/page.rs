@@ -49,11 +49,7 @@ pub struct PageBuilder {
 unsafe impl Send for PageBuilder {}
 
 impl PageBuilder {
-    pub(crate) fn new(
-        buf: NonNull<u8>,
-        shared: Arc<PoolShared>,
-        tenant: Arc<TenantStats>,
-    ) -> Self {
+    pub(crate) fn new(buf: NonNull<u8>, shared: Arc<PoolShared>, tenant: Arc<TenantStats>) -> Self {
         PageBuilder {
             buf: Some(buf),
             len: 0,
@@ -116,11 +112,7 @@ impl PageBuilder {
         // SAFETY: `buf[self.len .. self.len + data.len()]` lies inside
         // the exclusive `cap`-byte region we own.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                buf.as_ptr().add(self.len),
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_ptr().add(self.len), data.len());
         }
         self.len += data.len();
         Ok(())

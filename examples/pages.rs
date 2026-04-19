@@ -30,7 +30,9 @@ fn main() {
     let _p2 = pool.allocate(&tenant).seal();
     let stats_after = pool.stats().allocations_from_heap();
 
-    println!("heap allocations: {} → {} (reused the recycled buffer)",
-        stats_before, stats_after);
+    println!(
+        "heap allocations: {} → {} (reused the recycled buffer)",
+        stats_before, stats_after
+    );
     assert_eq!(stats_before, stats_after);
 }

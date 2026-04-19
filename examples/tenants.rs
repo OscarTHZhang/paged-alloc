@@ -18,14 +18,16 @@ fn main() {
     let _b1 = pool.alloc_from(&bob, &[0u8; 512]);
 
     print_tenant("alice", &alice);
-    print_tenant("bob",   &bob);
+    print_tenant("bob", &bob);
 
     // Tenant counters are AtomicU64s — metrics scrapers on other
     // threads can read them without synchronization from the owner.
     let alice_clone = alice.clone();
     std::thread::spawn(move || {
-        println!("\nmetrics thread sees alice.bytes_in_use = {}",
-                 alice_clone.stats().bytes_in_use());
+        println!(
+            "\nmetrics thread sees alice.bytes_in_use = {}",
+            alice_clone.stats().bytes_in_use()
+        );
     })
     .join()
     .unwrap();
@@ -33,8 +35,10 @@ fn main() {
 
 fn print_tenant(label: &str, t: &Tenant) {
     let s = t.stats();
-    println!("{label}: chunks={} bytes={} peak={}",
-             s.chunks_in_use(),
-             s.bytes_in_use(),
-             s.peak_bytes_in_use());
+    println!(
+        "{label}: chunks={} bytes={} peak={}",
+        s.chunks_in_use(),
+        s.bytes_in_use(),
+        s.peak_bytes_in_use()
+    );
 }

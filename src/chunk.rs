@@ -298,12 +298,7 @@ impl ChunkPool {
     /// On the packed path, requesting higher-than-default alignment
     /// may waste a few bytes in the current open page to reach an
     /// aligned offset.
-    pub fn allocate_aligned(
-        &mut self,
-        tenant: &Tenant,
-        size: usize,
-        align: usize,
-    ) -> ChunkBuilder {
+    pub fn allocate_aligned(&mut self, tenant: &Tenant, size: usize, align: usize) -> ChunkBuilder {
         assert!(
             align.is_power_of_two(),
             "align must be a power of two, got {align}"
@@ -428,12 +423,7 @@ impl ChunkPool {
         }
     }
 
-    fn allocate_packed(
-        &mut self,
-        tenant: &Tenant,
-        size: usize,
-        align: usize,
-    ) -> ChunkBuilder {
+    fn allocate_packed(&mut self, tenant: &Tenant, size: usize, align: usize) -> ChunkBuilder {
         let page_size = self.pages.page_size();
 
         // Find or open a page that has room for our aligned range.
@@ -456,7 +446,9 @@ impl ChunkPool {
         tenant.stats().record_chunk_allocate(size as u64);
         self.stats.total_chunks.fetch_add(1, Ordering::Relaxed);
         self.stats.chunks_in_use.fetch_add(1, Ordering::Relaxed);
-        self.stats.packed_allocations.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .packed_allocations
+            .fetch_add(1, Ordering::Relaxed);
 
         ChunkBuilder {
             packed: Some(shared),
@@ -494,12 +486,7 @@ impl ChunkPool {
         }
     }
 
-    fn allocate_oversized(
-        &mut self,
-        tenant: &Tenant,
-        size: usize,
-        align: usize,
-    ) -> ChunkBuilder {
+    fn allocate_oversized(&mut self, tenant: &Tenant, size: usize, align: usize) -> ChunkBuilder {
         let align = align.max(Self::DEFAULT_ALIGN);
         let layout = Layout::from_size_align(size, align)
             .expect("oversized layout from valid size + power-of-two align");
