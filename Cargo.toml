@@ -2,6 +2,14 @@
 name = "paged-alloc"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
+authors = ["Tianhe Zhang <oscar.zth1999@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+description = "Paged, multi-tenant, thread-per-core byte allocator for database engines"
+keywords = ["allocator", "memory", "database", "paged", "arena"]
+categories = ["memory-management", "caching", "concurrency", "database-implementations"]
+repository = "https://github.com/OscarTHZhang/paged-alloc"
 
 [dependencies]
 

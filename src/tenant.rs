@@ -48,6 +48,8 @@ pub struct TenantStats {
     pages_in_use: AtomicU64,
     total_pages_allocated: AtomicU64,
     peak_bytes_in_use: AtomicU64,
+    chunks_in_use: AtomicU64,
+    total_chunks_allocated: AtomicU64,
 }
 
 impl TenantStats {
@@ -65,6 +67,14 @@ impl TenantStats {
 
     pub fn peak_bytes_in_use(&self) -> u64 {
         self.peak_bytes_in_use.load(Ordering::Relaxed)
+    }
+
+    pub fn chunks_in_use(&self) -> u64 {
+        self.chunks_in_use.load(Ordering::Relaxed)
+    }
+
+    pub fn total_chunks_allocated(&self) -> u64 {
+        self.total_chunks_allocated.load(Ordering::Relaxed)
     }
 
     pub(crate) fn record_allocate(&self, page_bytes: u64) {
@@ -88,6 +98,23 @@ impl TenantStats {
         self.bytes_in_use.fetch_sub(page_bytes, Ordering::Relaxed);
         self.pages_in_use.fetch_sub(1, Ordering::Relaxed);
     }
+
+    pub(crate) fn record_chunk_allocate(&self, chunk_bytes: u64) {
+        self.total_chunks_allocated.fetch_add(1, Ordering::Relaxed);
+        self.chunks_in_use.fetch_add(1, Ordering::Relaxed);
+        let new_bytes = self
+            .bytes_in_use
+            .fetch_add(chunk_bytes, Ordering::Relaxed)
+            + chunk_bytes;
+        if new_bytes > self.peak_bytes_in_use.load(Ordering::Relaxed) {
+            self.peak_bytes_in_use.store(new_bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_chunk_release(&self, chunk_bytes: u64) {
+        self.bytes_in_use.fetch_sub(chunk_bytes, Ordering::Relaxed);
+        self.chunks_in_use.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl fmt::Debug for TenantStats {
@@ -97,6 +124,8 @@ impl fmt::Debug for TenantStats {
             .field("pages_in_use", &self.pages_in_use())
             .field("total_pages_allocated", &self.total_pages_allocated())
             .field("peak_bytes_in_use", &self.peak_bytes_in_use())
+            .field("chunks_in_use", &self.chunks_in_use())
+            .field("total_chunks_allocated", &self.total_chunks_allocated())
             .finish()
     }
 }

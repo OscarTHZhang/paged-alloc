@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
-use paged_alloc::{PagePool, Tenant};
+use paged_alloc::{ChunkPool, PagePool, Tenant};
 
 // Bench harness only: use mimalloc so we can distinguish pool-level
 // scaling from system-allocator scaling. This does not affect the
@@ -369,6 +369,90 @@ fn bench_startup_ready(c: &mut Criterion) {
 }
 
 #[cfg(unix)]
+/// Chunk allocation across the three size classes (packed /
+/// dedicated / oversized). Uses a 16 KiB page so threshold = 8 KiB.
+fn bench_chunk_paths(c: &mut Criterion) {
+    let mut group = c.benchmark_group("chunk_alloc");
+
+    // Packed: small sizes, share a page via bump allocation.
+    for &size in &[64usize, 256, 1024, 4096] {
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("packed", size), &size, |b, &size| {
+            let mut pool = ChunkPool::with_page_size(16 * 1024);
+            let tenant = Tenant::new("bench");
+            // Prime a packed page so the first timed iter is hot.
+            drop(pool.allocate(&tenant, size).seal());
+            b.iter(|| {
+                let c = pool.allocate(&tenant, size).seal();
+                black_box(&c);
+            });
+        });
+    }
+
+    // Dedicated: size > threshold but ≤ page_size; each chunk takes a
+    // fresh page.
+    for &size in &[10_usize * 1024, 12 * 1024] {
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("dedicated", size), &size, |b, &size| {
+            let mut pool = ChunkPool::with_page_size(16 * 1024);
+            let tenant = Tenant::new("bench");
+            drop(pool.allocate(&tenant, size).seal()); // warm
+            b.iter(|| {
+                let c = pool.allocate(&tenant, size).seal();
+                black_box(&c);
+            });
+        });
+    }
+
+    // Oversized: size > page_size; allocates direct from global.
+    for &size in &[64 * 1024, 256 * 1024] {
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("oversized", size), &size, |b, &size| {
+            let mut pool = ChunkPool::with_page_size(16 * 1024);
+            let tenant = Tenant::new("bench");
+            b.iter(|| {
+                let c = pool.allocate(&tenant, size).seal();
+                black_box(&c);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Measures the abstraction cost of `ChunkPool` over raw `PagePool`
+/// on a steady-state warm workload. Should be small — the hot path
+/// shares the same underlying free list.
+fn bench_chunk_vs_page(c: &mut Criterion) {
+    let mut group = c.benchmark_group("chunk_vs_page_overhead");
+    let page_size = 16 * 1024;
+    group.throughput(Throughput::Bytes(page_size as u64));
+
+    group.bench_function("page_full_alloc", |b| {
+        let mut pool = PagePool::new(page_size);
+        let tenant = Tenant::new("bench");
+        drop(pool.allocate(&tenant).seal());
+        b.iter(|| {
+            let p = pool.allocate(&tenant).seal();
+            black_box(&p);
+        });
+    });
+
+    // Chunk allocation of the same size: takes the dedicated path.
+    group.bench_function("chunk_full_alloc", |b| {
+        let mut pool = ChunkPool::with_page_size(page_size);
+        let tenant = Tenant::new("bench");
+        drop(pool.allocate(&tenant, page_size).seal());
+        b.iter(|| {
+            let c = pool.allocate(&tenant, page_size).seal();
+            black_box(&c);
+        });
+    });
+
+    group.finish();
+}
+
+#[cfg(unix)]
 criterion_group!(
     benches,
     bench_steady_state,
@@ -381,6 +465,8 @@ criterion_group!(
     bench_startup_ready,
     bench_source_cold_path,
     bench_source_steady_state,
+    bench_chunk_paths,
+    bench_chunk_vs_page,
 );
 #[cfg(not(unix))]
 criterion_group!(
@@ -393,5 +479,7 @@ criterion_group!(
     bench_concurrent_per_worker,
     bench_cross_thread_drop,
     bench_startup_ready,
+    bench_chunk_paths,
+    bench_chunk_vs_page,
 );
 criterion_main!(benches);

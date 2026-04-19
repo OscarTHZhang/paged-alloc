@@ -58,7 +58,7 @@ impl fmt::Debug for PoolStats {
 ///
 /// Held inside [`Arc<PoolShared>`] by each live [`Page`](crate::Page) so
 /// that pages dropped on non-owning threads can return their buffers
-/// via [`push_return`](Self::push_return). Also owns the
+/// via an internal `push_return` MPSC path. Also owns the
 /// [`PageSource`] so that buffers outstanding on non-owning threads
 /// when [`PagePool`] drops are still released by the matching source
 /// when the last [`Page`](crate::Page) eventually drops.
@@ -329,15 +329,27 @@ impl PagePool {
     /// one atomic swap. If the return queue is also empty, allocates a
     /// new buffer from the backing [`PageSource`].
     pub fn allocate(&mut self, tenant: &Tenant) -> PageBuilder {
+        let (buf, shared) = self.allocate_raw_page();
+        tenant.stats().record_allocate(shared.page_size as u64);
+        PageBuilder::new(buf, shared, tenant.stats_arc())
+    }
+
+    /// Allocates one raw page without wrapping in [`PageBuilder`] and
+    /// without touching tenant accounting. Used by higher-level layers
+    /// (e.g. `ChunkPool`) that account for allocations at sub-page
+    /// granularity and wrap the buffer in their own lifecycle type.
+    ///
+    /// The returned `NonNull<u8>` points to a `page_size`-byte region
+    /// produced by this pool's [`PageSource`]. The caller becomes
+    /// responsible for eventually returning the buffer by calling
+    /// [`PoolShared::push_return`] on the accompanying `Arc<PoolShared>`.
+    pub(crate) fn allocate_raw_page(&mut self) -> (NonNull<u8>, Arc<PoolShared>) {
         let buf = self
             .pop_local()
             .or_else(|| self.drain_return_queue())
             .unwrap_or_else(|| self.allocate_fresh());
-
         self.shared.stats.pages_in_use.fetch_add(1, Ordering::Relaxed);
-        tenant.stats().record_allocate(self.shared.page_size as u64);
-
-        PageBuilder::new(buf, self.shared.clone(), tenant.stats_arc())
+        (buf, self.shared.clone())
     }
 
     fn pop_local(&mut self) -> Option<NonNull<u8>> {

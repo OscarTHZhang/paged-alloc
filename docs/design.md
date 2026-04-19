@@ -1,6 +1,6 @@
 # paged-alloc — Design Note
 
-**Status:** v0.2, living document
+**Status:** v0.3, living document
 **Audience:** contributors and users integrating this crate into a thread-per-core database engine
 **Reproducing the numbers:** `scripts/bench.sh` runs the full criterion suite and prints the same tables shown in §10.
 
@@ -54,7 +54,7 @@ beyond the minimum needed for an intrusive free list.
   job; keeping this out of the library avoids coupling to any particular
   threading or metrics model.
 
-### What's shipped as of v0.2
+### What's shipped as of v0.3
 
 - `HeapSource` — default, backed by `std::alloc::alloc_zeroed`.
 - `MmapSource` — POSIX anonymous mmap (`cfg(unix)`).
@@ -62,6 +62,11 @@ beyond the minimum needed for an intrusive free list.
 - `PagePool::prewarm` — commit N pages into the free list at startup,
   invoking `PageSource::prefault` on each so lazy-backed sources
   (future huge-pages) fault synchronously outside the request path.
+- **`ChunkPool` / `Chunk` / `ChunkBuilder`** (new in v0.3) — variable-
+  size byte allocation layered on top of `PagePool`. The caller
+  specifies the exact byte size they want; the library hides the
+  underlying page structure, packing small allocations together and
+  routing oversized ones direct to the heap.
 
 ## 3. Workload assumptions
 
@@ -127,18 +132,23 @@ let mut huge = PagePool::with_source(
 
 | Type | Role | Thread-safety |
 |---|---|---|
-| `PagePool` | Worker-owned allocator. Holds the local intrusive free-list head and an `Arc<PoolShared>`. | `Send + !Sync`. `allocate` takes `&mut self`. |
-| `PoolShared` | Cross-thread-visible portion of a pool. Owns the backing `Box<dyn PageSource>`, the atomic MPSC `return_head`, and atomic `PoolStats`. | `Send + Sync`. Held by every live `Page`. |
+| `PagePool` | Worker-owned fixed-size-page allocator. Holds the local intrusive free-list head and an `Arc<PoolShared>`. | `Send + !Sync`. `allocate` takes `&mut self`. |
+| `PoolShared` | Cross-thread-visible portion of a page pool. Owns the backing `Box<dyn PageSource>`, the atomic MPSC `return_head`, and atomic `PoolStats`. | `Send + Sync`. Held by every live `Page`. |
 | `PoolStats` | Atomic `u64` counters: `allocations_from_heap`, `pages_in_use`, `free_pages`, `return_queue_drains`, `prewarmed_pages`. | Safe to read from any thread. |
 | `PageBuilder` | Exclusive writable handle to a fresh page. Exposes `append`, `as_mut_slice`, `set_len`, `remaining`. Stores a raw `NonNull<u8>` buffer. | `Send + !Sync`. |
-| `Page` | Immutable, reference-counted sealed handle. Derefs to `&[u8]`. | `Send + Sync`. Drops from any thread. |
+| `Page` | Immutable, reference-counted sealed page handle. Derefs to `&[u8]`. | `Send + Sync`. Drops from any thread. |
+| `ChunkPool` *(new)* | Worker-owned variable-size allocator built on top of a `PagePool`. `allocate(tenant, size)` dispatches to packed / dedicated / oversized path. | `Send + !Sync`. `allocate` takes `&mut self`. |
+| `ChunkBuilder` *(new)* | Exclusive writable handle to a freshly allocated chunk. Same shape as `PageBuilder` but capacity is the caller-requested byte size. | `Send + !Sync`. |
+| `Chunk` *(new)* | Immutable, reference-counted chunk handle. Derefs to `&[u8]`. May share an underlying page with other chunks (packed path), own a full page (dedicated), or own a heap-allocated buffer (oversized). | `Send + Sync`. Drops from any thread. |
+| `ChunkPoolStats` *(new)* | Atomic counters: `total_chunks`, `chunks_in_use`, per-path allocation counts, `oversized_bytes_in_use`. | Safe to read from any thread. |
 | `PageSource` (trait) | Pluggable backing-memory strategy: `page_size`, `allocate`, `release`, `prefault`. | `Send + Sync`. |
 | `HeapSource` | Default source: `alloc_zeroed` / `dealloc`. | `Send + Sync`. |
 | `MmapSource` | `mmap(MAP_ANONYMOUS \| MAP_PRIVATE)` / `munmap`. `cfg(unix)`. | `Send + Sync`. |
 | `HugePageSource` | `mmap(MAP_ANONYMOUS \| MAP_PRIVATE \| MAP_HUGETLB)`. `cfg(target_os = "linux")`. | `Send + Sync`. |
 | `Tenant` | Cheap, cloneable handle carrying a `TenantId` and `Arc<TenantStats>`. | `Send + Sync`. |
-| `TenantStats` | Atomic counters: `bytes_in_use`, `pages_in_use`, `total_pages_allocated`, `peak_bytes_in_use`. | Safe for any reader; writes are single-writer in the common case. Relaxed atomics. |
+| `TenantStats` | Atomic counters: `bytes_in_use`, `pages_in_use`, `total_pages_allocated`, `peak_bytes_in_use`, `chunks_in_use`, `total_chunks_allocated`. | Safe for any reader; writes are single-writer in the common case. Relaxed atomics. |
 | `PageFull` | Error returned by `PageBuilder::append` when a write would overflow the page. | — |
+| `ChunkFull` *(new)* | Error returned by `ChunkBuilder::append` when a write would overflow the chunk. | — |
 
 ## 5. Lifecycle of a page
 
@@ -246,6 +256,151 @@ startup-to-ready time from **149 µs → 61 µs** (2.45× speedup), saving
 request path. For a future mmap or huge-page pool the savings are
 much larger because `prefault` pays page-fault cost upfront instead
 of during the first request that touches each page.
+
+## 5.3 Variable-size allocation: `ChunkPool`
+
+`PagePool` gives callers fixed-size pages. That's the right
+abstraction for file-block caches, `O_DIRECT` buffers, and anything
+that wants page-aligned allocations at a specific size. It's the
+wrong abstraction for workloads where records don't fit the page
+geometry: log records that are ~64–512 bytes each, file cache values
+that exceed a page, memtable entries with heterogeneous sizes.
+
+`ChunkPool` sits on top of `PagePool` and presents a size-based API.
+Callers say "give me a chunk of N bytes" and get a [`ChunkBuilder`]
+with exactly N bytes of capacity; seal it into a [`Chunk`] that
+derefs to a contiguous `&[u8]` of length N. The caller never sees
+the underlying page boundary.
+
+### Three size classes
+
+Each allocation takes one of three paths based on its size relative
+to the configured `page_size`:
+
+| Size | Path | Layout |
+|---|---|---|
+| `size == 0` | Zero | No backing buffer at all. Dangling-but-aligned handle returned. |
+| `0 < size ≤ page_size / 2` | **Packed** | Shares an open page with other small allocations via a bump cursor. Many chunks per page. |
+| `page_size / 2 < size ≤ page_size` | **Dedicated** | Takes a full fresh page from the underlying `PagePool`. One chunk per page; no packing. |
+| `size > page_size` | **Oversized** | Bypasses the `PagePool` entirely; `std::alloc::alloc_zeroed(Layout)` with the exact size and alignment. |
+
+The split between packed and dedicated at `page_size / 2` is the
+standard bump-vs-slab cutoff: above half a page, you can fit at most
+one chunk per page anyway, so packing buys nothing and costs you
+fragmentation bookkeeping. Below half a page, packing density is
+meaningful (16 KiB pages can hold 256 × 64-byte chunks).
+
+The oversized path does not go through `PageSource`. That trait has
+a fixed `page_size()` and isn't useful for one-off allocations of
+arbitrary size; the global allocator is. Oversized buffers are
+tracked per-pool in `ChunkPoolStats::oversized_bytes_in_use` so
+observability is preserved.
+
+### `PackedPage` and the shared-buffer invariant
+
+The non-trivial piece is the packed path. A single underlying
+`page_size`-byte buffer can back multiple live `Chunk` handles
+referencing disjoint ranges of its bytes, while the pool is
+simultaneously writing new allocations to the tail of the same
+buffer. This would be unsound without a careful invariant.
+
+The invariant:
+
+> The currently-open page maintains a monotonic `write_offset`
+> cursor. Every allocation claims `[align_up(cursor, align),
+> cursor+size+padding)` and advances the cursor past that range.
+> The range is frozen at allocation time: no subsequent writer
+> touches it. `Chunk` handles are issued only after their range is
+> frozen.
+
+From this invariant:
+
+- Multiple `Chunk` handles from the same page reference **disjoint**
+  byte ranges.
+- A `ChunkBuilder` writing to its range cannot overlap with any
+  `Chunk`'s range on the same page, because its range is strictly
+  after every previously-issued range.
+- Concurrent reads through a `Chunk` (on one thread) and writes
+  through a subsequent `ChunkBuilder` (on the pool-owning thread)
+  touch disjoint bytes of the same buffer — no data race even
+  without per-byte synchronization.
+
+This makes the manual `unsafe impl Send for PackedPage` and `unsafe
+impl Sync for PackedPage` sound: the `PackedPage`'s `NonNull<u8>` is
+an owning pointer, but the type never mutably dereferences it
+through a `&self` method, and all user-facing reads/writes go
+through `Chunk::as_slice` / `ChunkBuilder::as_mut_slice` which carry
+a `(offset, length)` that the invariant guarantees is disjoint from
+every other access.
+
+A `PackedPage` is ref-counted via `Arc<PackedPage>`. The
+`ChunkPool` holds one `Arc` for its currently-open page; each
+`Chunk` holds one too. When the `ChunkPool` opens a new page, it
+drops its handle to the old one; when the last `Chunk` from that
+old page drops, `Arc::drop` fires `PackedPage::drop`, which routes
+the buffer back to its origin via the `Release` enum (pool's MPSC
+return queue for pool-backed, `std::alloc::dealloc` for oversized).
+
+### Stats: two independent levels
+
+`ChunkPool` exposes two stats surfaces:
+
+- `chunk_pool.stats() -> &ChunkPoolStats` — chunk-level: total
+  chunks allocated (lifetime), chunks in use (current), count by
+  path (packed/dedicated/oversized), oversized bytes in use.
+- `chunk_pool.page_stats() -> &PoolStats` — page-level: heap
+  allocations, pages in use, return-queue drains, etc. Delegates to
+  the underlying `PagePool`.
+
+`TenantStats` gets two new fields — `chunks_in_use` and
+`total_chunks_allocated` — that advance on `ChunkPool` allocations
+and are independent of the page-level counters. A tenant that uses
+both a `PagePool` and a `ChunkPool` sees:
+
+- `tenant.bytes_in_use()` = sum of bytes from both allocators.
+- `tenant.pages_in_use()` / `total_pages_allocated()` = page
+  allocations only.
+- `tenant.chunks_in_use()` / `total_chunks_allocated()` = chunk
+  allocations only.
+
+No double-counting: packed pages allocated by `ChunkPool` are not
+attributed to any tenant at the page level — they're shared
+infrastructure. Only the chunks that carve into them are attributed
+to tenants.
+
+### Alignment
+
+`allocate(tenant, size)` uses pointer alignment (`align_of::<*mut
+u8>()`) by default. `allocate_aligned(tenant, size, align)` lets
+callers request higher alignment (e.g. 64-byte SIMD alignment,
+4 KiB for `O_DIRECT` staging buffers).
+
+On the packed path, aligning up may waste a few bytes of padding
+before the allocated range. This is accepted — the alternative
+(refusing to pack misaligned requests, or using a separate slab per
+alignment) would be complexity out of proportion to the tiny space
+cost.
+
+On the dedicated path, the whole page is returned at its natural
+alignment (whatever the `PageSource` provides).
+
+On the oversized path, the `Layout` passed to `alloc_zeroed`
+specifies `max(align, pointer_align)`, so the allocator guarantees
+the requested alignment.
+
+### When to use which
+
+| Workload | Use |
+|---|---|
+| `O_DIRECT` file-block cache, fixed 4 KiB or 16 KiB records | `PagePool` |
+| File-content cache with heterogeneous file sizes | `ChunkPool` |
+| Memtable appending log records of 10s–1000s of bytes | `ChunkPool` |
+| In-memory slab of fixed-size B-tree nodes | `PagePool` if node size == page size; otherwise `ChunkPool` |
+| Scratch buffers for serialization / decompression | `ChunkPool` |
+
+`ChunkPool` is the more general tool. `PagePool` remains available
+for the cases where the caller specifically wants a fixed page
+boundary or page alignment.
 
 ## 6. Free list design
 
@@ -589,6 +744,42 @@ Time to serve N sealed pages from a cold-started worker:
 Prewarming moves the source's cold-path cost out of the request path
 into process startup.
 
+### Chunk allocation
+
+Warm steady-state, 16 KiB underlying pages, threshold 8 KiB:
+
+| Path | Size | Time / op |
+|---|---|---|
+| Packed | 64 B | 39 ns |
+| Packed | 256 B | 39 ns |
+| Packed | 1 KiB | 40 ns |
+| Packed | 4 KiB | 44 ns |
+| Dedicated | 10 KiB | 56 ns |
+| Dedicated | 12 KiB | 56 ns |
+| Oversized | 64 KiB | 692 ns |
+| Oversized | 256 KiB | 2.5 µs |
+
+Packed path cost is essentially the same as raw `PagePool` steady
+state (~38 ns) — the extra `Arc<ChunkInner>` allocation per chunk is
+the only real delta, and mimalloc serves 80-byte allocations from
+its thread-local cache. Dedicated adds ~18 ns over `Page` for the
+extra `Arc<PackedPage>` and chunk-level stats updates. Oversized is
+dominated by `alloc_zeroed` memset time (proportional to size).
+
+### Chunk abstraction overhead
+
+Side-by-side at 16 KiB:
+
+| Layer | Time |
+|---|---|
+| `PagePool::allocate → seal → drop` | 38 ns |
+| `ChunkPool::allocate(size=page_size)` (dedicated path) | 57 ns |
+
+The +19 ns (+50%) overhead is the price of variable-size
+abstraction and chunk-level accounting. Users who specifically need
+fixed-page semantics should prefer `PagePool` directly; users with
+variable-size records should use `ChunkPool` and accept this cost.
+
 ### Other
 
 - **`cross_thread_drop`** (page allocated on owner, dropped on N sibling threads): 72 ns (1 dropper) → 172 ns (8 droppers). Atomic CAS on `return_head` contends as the dropper count grows; single-dropper cost is just one CAS.
@@ -600,21 +791,26 @@ into process startup.
 ```
 src/
 ├── lib.rs       Crate docs, module wiring, public re-exports.
-├── tenant.rs    TenantId, TenantStats (atomic counters, single-writer
-│                peak update via load-then-store), Tenant.
+├── tenant.rs    TenantId, TenantStats (atomic counters — page-level
+│                and chunk-level, single-writer peak update via
+│                load-then-store), Tenant.
 ├── source.rs    PageSource trait + HeapSource (alloc_zeroed / dealloc).
 ├── mmap.rs      cfg(unix) MmapSource; cfg(target_os="linux")
 │                HugePageSource; madvise_dontneed free function.
 ├── pool.rs      PagePool (local intrusive head, allocate(&mut self),
-│                prewarm, with_capacity, with_source),
+│                allocate_raw_page, prewarm, with_capacity, with_source),
 │                PoolShared (Box<dyn PageSource>, AtomicPtr return_head,
 │                atomic PoolStats, push_return / drain_return_queue).
-└── page.rs      PageFull error, PageBuilder (write phase, NonNull<u8>
-                 buffer), Page (Arc<PageInner>, Send+Sync, derefs to
-                 &[u8]), PageInner::drop → push_return.
+├── page.rs      PageFull error, PageBuilder (write phase, NonNull<u8>
+│                buffer), Page (Arc<PageInner>, Send+Sync, derefs to
+│                &[u8]), PageInner::drop → push_return.
+└── chunk.rs     ChunkPool (packed/dedicated/oversized dispatch on top
+                 of PagePool::allocate_raw_page + std::alloc for
+                 oversized), ChunkBuilder, Chunk, ChunkInner,
+                 ChunkPoolStats, internal PackedPage with Release enum.
 
 tests/
-└── integration.rs  18 tests including:
+└── integration.rs  35 tests including, for PagePool:
                     - cross_thread_drop_returns_via_atomic_queue
                     - concurrent_per_worker_pools
                     - tenant_stats_track_bytes_and_peak
@@ -624,9 +820,20 @@ tests/
                     - pool_drop_releases_buffers_still_on_return_queue
                     - mmap_source_end_to_end
                     - madvise_dontneed_zeroes_region_linux (Linux-only)
+                    and for ChunkPool:
+                    - chunk_small_packs_into_shared_page
+                    - chunk_dedicated_takes_whole_page
+                    - chunk_oversized_bypasses_pool
+                    - chunk_packing_rolls_to_next_page_when_full
+                    - chunk_packed_page_retains_until_last_chunk_drops
+                    - chunk_cross_thread_drop
+                    - chunk_send_sync_readers
+                    - chunk_prewarm_avoids_cold_path_for_first_allocs
+                    - chunk_aligned_allocation_pads_packed_offset
+                    - chunk_page_and_chunk_stats_are_independent
 
 benches/
-└── alloc.rs     10 criterion benches:
+└── alloc.rs     12 criterion benches:
                  - steady_state_alloc_seal_drop
                  - heap_baseline_box_slice
                  - cold_alloc_seal_drop
@@ -637,6 +844,8 @@ benches/
                  - startup_ready         (cold vs prewarmed, 64/256/1024)
                  - source_cold_path      (heap vs mmap, 16 KiB/64 KiB)
                  - source_steady_state   (heap vs mmap, warm free list)
+                 - chunk_alloc           (packed/dedicated/oversized)
+                 - chunk_vs_page_overhead (abstraction cost at 16 KiB)
                  Uses mimalloc in the harness to surface pool-level
                  scaling independent of libmalloc.
 
@@ -670,6 +879,13 @@ implemented:
 - ✅ **`madvise_dontneed` helper** — exposed on `cfg(unix)` so a
   higher-level cache layer can release physical backing on eviction.
 
+**Already shipped in v0.3:**
+
+- ✅ **Variable-size allocation** via `ChunkPool` / `Chunk`. Packed
+  small-record storage, dedicated full-page, oversized
+  heap-direct. Page size no longer leaks into the user-facing API
+  for the common case.
+
 **Still out of scope but buildable on top:**
 
 - **Quota enforcement.** A thin wrapper type over `PagePool` that
@@ -696,21 +912,25 @@ implemented:
 ## 13. Open questions
 
 - **Should the cold-path buffer allocation be zero-initialized?** Today
-  it is (`vec![0u8; page_size]`), which costs a memset at creation time.
-  Recycled buffers are **not** zeroed — the "write before read" contract
-  on `PageBuilder::as_mut_slice` allows stale bytes. Moving to
-  `Box::new_uninit_slice` for the cold path would save the first-touch
-  memset at the cost of an unsafe transmute. Unclear whether the
-  workload sees this.
+  it is (`alloc_zeroed` in `HeapSource`, lazy zero-fill in `MmapSource`),
+  which costs a memset at creation time for the heap backend. Recycled
+  buffers are **not** zeroed — the "write before read" contract on
+  `PageBuilder::as_mut_slice` and `ChunkBuilder::as_mut_slice` allows
+  stale bytes. Moving the cold path to `Box::new_uninit_slice` for
+  `HeapSource` would save the first-touch memset at the cost of some
+  unsafe transmute. Unclear whether real workloads see this — the
+  prewarm path already amortizes this cost to startup.
 - **Is a `Tenant::snapshot()` helper worth adding?** Today callers
   sum fields individually; a one-call snapshot would avoid a torn read
-  across multiple atomics. Low priority.
-- **Should `PagePool::Drop` drain the return queue from other threads
-  with a memory fence?** Today it does an `Acquire` swap which is
-  sufficient under the current usage model (no dropper touches the
-  queue after the owner's `Drop` begins), but if we ever allow
-  `PagePool` to be dropped while workers still hold `Page` clones, we'd
-  need to rethink the lifetime story.
+  across multiple atomics. Low priority; most metrics systems tolerate
+  brief inconsistency between related counters.
+
+(An earlier open question about `PagePool::Drop` memory fencing was
+resolved during the v0.2 work: `PoolShared::Drop` now correctly drains
+the return queue with an `Acquire` swap, and this handles the
+"pool dropped while `Page` clones still live" case via the
+`Arc<PoolShared>` outliving any live page. See §6 for the full
+ownership and lifetime story.)
 
 ## 14. Revision history
 
@@ -720,6 +940,33 @@ implemented:
     (stats/Arc contention).
   - Single-writer pool + lock-free MPSC free list. Pairs with a
     scalable global allocator for near-linear scaling.
+
+- **v0.3**
+  - Added `ChunkPool`, `ChunkBuilder`, `Chunk`, `ChunkPoolStats`,
+    `ChunkFull`. Variable-size byte allocator layered on `PagePool`
+    with three-path dispatch (packed / dedicated / oversized). Page
+    size is now hidden from the user-facing API for the common
+    memtable / cache use cases.
+  - Internal `PackedPage` type with `Release { Pool, Heap }` enum to
+    route buffer release either back through the `PagePool`'s MPSC
+    return queue or directly to `std::alloc::dealloc` for oversized
+    allocations.
+  - Extended `TenantStats` with `chunks_in_use` and
+    `total_chunks_allocated`; `record_chunk_allocate` /
+    `record_chunk_release` methods. Page-level and chunk-level
+    counters advance independently.
+  - Added `pub(crate) PagePool::allocate_raw_page` so `ChunkPool`
+    can grab raw buffers without the `PageBuilder` wrapping or
+    per-page tenant accounting.
+  - 17 new integration tests for packed sharing, dedicated, oversized,
+    packing-roll, cross-thread drop, alignment, prewarm interaction,
+    stats independence.
+  - 2 new criterion bench groups (`chunk_alloc`,
+    `chunk_vs_page_overhead`) and a new section in
+    `scripts/bench.sh` that prints them.
+  - Measured: packed path ~40 ns (same as raw `PagePool`),
+    dedicated path ~57 ns (+19 ns for Arc<ChunkInner> +
+    Arc<PackedPage>), oversized ~700 ns for 64 KiB (memset-bound).
 
 - **v0.2**
   - Extracted the backing-memory strategy behind a `PageSource` trait.

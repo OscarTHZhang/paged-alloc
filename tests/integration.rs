@@ -4,7 +4,7 @@ use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use paged_alloc::{PagePool, PageSource, Tenant};
+use paged_alloc::{ChunkPool, PagePool, PageSource, Tenant};
 
 #[test]
 fn alloc_seal_and_read() {
@@ -404,6 +404,368 @@ fn madvise_dontneed_zeroes_region_linux() {
     let after = builder.as_mut_slice();
     assert!(after.iter().all(|&b| b == 0));
 }
+
+// =========================================================================
+// ChunkPool tests
+// =========================================================================
+
+#[test]
+fn chunk_alloc_seal_and_read() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    let mut b = pool.allocate(&tenant, 11);
+    assert_eq!(b.capacity(), 11);
+    b.append(b"hello ").unwrap();
+    b.append(b"world").unwrap();
+    assert_eq!(b.len(), 11);
+
+    let chunk = b.seal();
+    assert_eq!(&chunk[..], b"hello world");
+    assert_eq!(chunk.capacity(), 11);
+    assert_eq!(chunk.len(), 11);
+
+    assert_eq!(tenant.stats().chunks_in_use(), 1);
+    assert_eq!(tenant.stats().total_chunks_allocated(), 1);
+    assert_eq!(tenant.stats().bytes_in_use(), 11);
+}
+
+#[test]
+fn chunk_small_packs_into_shared_page() {
+    // Pages are 16 KiB, threshold is 8 KiB. Ten 64-byte chunks should
+    // all land in one underlying page.
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    let mut chunks = Vec::new();
+    for i in 0..10 {
+        let mut b = pool.allocate(&tenant, 64);
+        b.as_mut_slice()[0] = i as u8;
+        b.set_len(64);
+        chunks.push(b.seal());
+    }
+
+    // Exactly 1 underlying page: 1 heap allocation.
+    assert_eq!(pool.page_stats().allocations_from_heap(), 1);
+    assert_eq!(pool.stats().packed_allocations(), 10);
+    assert_eq!(pool.stats().dedicated_allocations(), 0);
+    assert_eq!(pool.stats().oversized_allocations(), 0);
+
+    for (i, c) in chunks.iter().enumerate() {
+        assert_eq!(c[0], i as u8);
+        assert_eq!(c.len(), 64);
+    }
+}
+
+#[test]
+fn chunk_dedicated_takes_whole_page() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    // 10 KiB > threshold (8 KiB) so this goes to the dedicated path.
+    let c1 = pool.allocate(&tenant, 10 * 1024).seal();
+    let c2 = pool.allocate(&tenant, 10 * 1024).seal();
+
+    assert_eq!(pool.stats().dedicated_allocations(), 2);
+    assert_eq!(pool.stats().packed_allocations(), 0);
+    assert_eq!(pool.page_stats().allocations_from_heap(), 2);
+    drop(c1);
+    drop(c2);
+}
+
+#[test]
+fn chunk_oversized_bypasses_pool() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    let size = 64 * 1024; // 4× page_size
+    let chunk = pool.allocate(&tenant, size).seal();
+    assert_eq!(chunk.capacity(), size);
+
+    assert_eq!(pool.stats().oversized_allocations(), 1);
+    assert_eq!(pool.stats().oversized_bytes_in_use(), size as u64);
+    // Underlying PagePool was NOT touched.
+    assert_eq!(pool.page_stats().allocations_from_heap(), 0);
+    assert_eq!(pool.page_stats().pages_in_use(), 0);
+
+    drop(chunk);
+    assert_eq!(pool.stats().oversized_bytes_in_use(), 0);
+    assert_eq!(pool.stats().chunks_in_use(), 0);
+}
+
+#[test]
+fn chunk_drop_decrements_stats() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+    let c = pool.allocate(&tenant, 128).seal();
+    assert_eq!(pool.stats().chunks_in_use(), 1);
+    assert_eq!(tenant.stats().chunks_in_use(), 1);
+    assert_eq!(tenant.stats().bytes_in_use(), 128);
+    drop(c);
+    assert_eq!(pool.stats().chunks_in_use(), 0);
+    assert_eq!(tenant.stats().chunks_in_use(), 0);
+    assert_eq!(tenant.stats().bytes_in_use(), 0);
+    // Total is monotonic, stays at 1.
+    assert_eq!(tenant.stats().total_chunks_allocated(), 1);
+}
+
+#[test]
+fn chunk_clone_shares_ref_count() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+    let c1 = pool.allocate(&tenant, 64).seal();
+    let c2 = c1.clone();
+    let c3 = c1.clone();
+    assert_eq!(c1.ref_count(), 3);
+    // In-use is a per-chunk concept, not per-handle: 3 handles = 1 chunk.
+    assert_eq!(tenant.stats().chunks_in_use(), 1);
+    drop(c1);
+    drop(c2);
+    assert_eq!(tenant.stats().chunks_in_use(), 1);
+    drop(c3);
+    assert_eq!(tenant.stats().chunks_in_use(), 0);
+}
+
+#[test]
+fn chunk_builder_drop_unsealed_releases_stats() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+    {
+        let _b = pool.allocate(&tenant, 256);
+        assert_eq!(tenant.stats().chunks_in_use(), 1);
+        assert_eq!(tenant.stats().bytes_in_use(), 256);
+    }
+    assert_eq!(tenant.stats().chunks_in_use(), 0);
+    assert_eq!(tenant.stats().bytes_in_use(), 0);
+    // Builder did bump total_chunks_allocated (allocation happened).
+    assert_eq!(tenant.stats().total_chunks_allocated(), 1);
+}
+
+#[test]
+fn chunk_zero_size() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    let c = pool.allocate(&tenant, 0).seal();
+    assert_eq!(c.len(), 0);
+    assert_eq!(c.capacity(), 0);
+    assert!(c.as_slice().is_empty());
+    // No underlying page allocation for zero-size chunks.
+    assert_eq!(pool.page_stats().allocations_from_heap(), 0);
+}
+
+#[test]
+fn chunk_alloc_from_copy_in() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+    let c = pool.alloc_from(&tenant, b"hello world");
+    assert_eq!(&c[..], b"hello world");
+    assert_eq!(c.len(), 11);
+}
+
+#[test]
+fn chunk_packing_rolls_to_next_page_when_full() {
+    // 16 KiB page, threshold 8 KiB. Four 4 KiB chunks exactly fill
+    // one page; the fifth has to roll to a new page.
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    let _a = pool.allocate(&tenant, 4096).seal();
+    let _b = pool.allocate(&tenant, 4096).seal();
+    let _c = pool.allocate(&tenant, 4096).seal();
+    let _d = pool.allocate(&tenant, 4096).seal();
+    // Four chunks still fit in the first page.
+    assert_eq!(pool.page_stats().allocations_from_heap(), 1);
+    let _e = pool.allocate(&tenant, 4096).seal();
+    // Fifth rolls to a new page.
+    assert_eq!(pool.page_stats().allocations_from_heap(), 2);
+    assert_eq!(pool.stats().packed_allocations(), 5);
+}
+
+#[test]
+fn chunk_packed_page_retains_until_last_chunk_drops() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+    let a = pool.allocate(&tenant, 64).seal();
+    let b = pool.allocate(&tenant, 64).seal();
+    let c = pool.allocate(&tenant, 64).seal();
+    assert_eq!(pool.page_stats().free_pages(), 0);
+
+    // Drop two of three. Page must NOT return yet — one chunk still holds it.
+    drop(a);
+    drop(b);
+    assert_eq!(pool.page_stats().free_pages(), 0);
+
+    // Also drop the ChunkPool's internal reference by forcing a new
+    // page open via a fresh allocation that triggers roll... actually,
+    // simpler: drop the pool's "current" via dropping the pool.
+    // Or explicitly: free_pages stays 0 until `c` drops AND the pool's
+    // current-page handle no longer points at it.
+    //
+    // The simpler assertion: until `c` drops, free_pages is 0.
+    drop(pool); // releases the pool's local head and current-page handle
+    // After pool drop, only `c` holds the packed page.
+    drop(c);
+    // By now the buffer has been released via PackedPage::drop ->
+    // PoolShared::push_return. But the PoolShared was dropped with
+    // the pool... actually no: the Arc<PoolShared> in PackedPage's
+    // Release::Pool keeps PoolShared alive. When the last chunk
+    // drops, PackedPage::drop calls shared.push_return, which adds
+    // to the return queue of a PoolShared whose PagePool is gone.
+    // That's fine — the buffer is still released via PoolShared::drop
+    // eventually, when the Arc<PoolShared> count hits 0.
+    //
+    // This test's assertion isn't about counters (pool is gone); it's
+    // about not panicking and cleanly releasing.
+}
+
+#[test]
+fn chunk_cross_thread_drop() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+    let chunk = pool.allocate(&tenant, 128).seal();
+    thread::spawn(move || drop(chunk)).join().unwrap();
+    // Tenant counter decremented from a non-owner thread.
+    assert_eq!(tenant.stats().chunks_in_use(), 0);
+}
+
+#[test]
+fn chunk_send_sync_readers() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+    let mut b = pool.allocate(&tenant, 6);
+    b.append(b"shared").unwrap();
+    let chunk = b.seal();
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let c = chunk.clone();
+            thread::spawn(move || assert_eq!(&c[..], b"shared"))
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+#[test]
+fn chunk_prewarm_avoids_cold_path_for_first_allocs() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    pool.prewarm(2);
+    // No chunks yet but 2 pages are ready.
+    assert_eq!(pool.page_stats().allocations_from_heap(), 2);
+    let heap_before = pool.page_stats().allocations_from_heap();
+
+    let tenant = Tenant::new("t");
+    // Fit many small chunks — they consume one of the prewarmed pages.
+    let mut sink = Vec::new();
+    for _ in 0..20 {
+        sink.push(pool.allocate(&tenant, 64).seal());
+    }
+    assert_eq!(pool.page_stats().allocations_from_heap(), heap_before);
+}
+
+#[test]
+fn chunk_aligned_allocation_pads_packed_offset() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    // Start with a 3-byte chunk; cursor becomes 3.
+    let _a = pool.allocate(&tenant, 3).seal();
+    // Request 64-byte-aligned allocation. Cursor advances to 64 first,
+    // wasting 61 bytes, then claims 64 bytes.
+    let mut b = pool.allocate_aligned(&tenant, 64, 64);
+    b.set_len(0);
+    // Check that the buffer pointer we got is 64-aligned.
+    let ptr = b.as_mut_slice().as_mut_ptr() as usize;
+    assert_eq!(ptr % 64, 0, "aligned allocation must be 64-byte aligned");
+    let _ = b.seal();
+}
+
+#[test]
+fn chunk_oversized_alignment_via_layout() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+    let mut b = pool.allocate_aligned(&tenant, 64 * 1024, 4096);
+    let ptr = b.as_mut_slice().as_mut_ptr() as usize;
+    assert_eq!(ptr % 4096, 0);
+    b.set_len(0);
+    let _ = b.seal();
+}
+
+#[test]
+fn chunk_append_overflow_returns_error() {
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+    let mut b = pool.allocate(&tenant, 8);
+    b.append(b"1234").unwrap();
+    let err = b.append(b"56789").unwrap_err();
+    assert_eq!(err.capacity, 8);
+    assert_eq!(err.len, 4);
+    assert_eq!(err.attempted, 5);
+}
+
+#[cfg(unix)]
+#[test]
+fn chunk_pool_with_mmap_source() {
+    use paged_alloc::{ChunkPool, MmapSource};
+
+    // ChunkPool on top of MmapSource — the free list, packing path,
+    // and return-queue drain must all work regardless of whether the
+    // backing buffers came from the heap or from mmap. 16 KiB is a
+    // multiple of any OS page size (4 KiB or 16 KiB on arm64 macOS).
+    let mut pool = ChunkPool::with_source(MmapSource::new(16 * 1024));
+    pool.prewarm(4);
+
+    let tenant = Tenant::new("t");
+
+    // Allocate enough small chunks to exercise packing + rollover.
+    let mut chunks = Vec::new();
+    for i in 0..32 {
+        let data = vec![i as u8; 128];
+        chunks.push(pool.alloc_from(&tenant, &data));
+    }
+
+    // All 32 chunks should pack into ≤ 2 mmap'd pages (16 KiB / 128 B = 128
+    // slots per page, but packing_allocations tracks each one).
+    assert_eq!(pool.stats().packed_allocations(), 32);
+    assert_eq!(tenant.stats().chunks_in_use(), 32);
+
+    // Round-trip content check.
+    for (i, c) in chunks.iter().enumerate() {
+        assert_eq!(c.len(), 128);
+        assert_eq!(c[0], i as u8);
+        assert_eq!(c[127], i as u8);
+    }
+
+    // Drop everything and confirm counters clear.
+    drop(chunks);
+    assert_eq!(tenant.stats().chunks_in_use(), 0);
+    assert_eq!(tenant.stats().bytes_in_use(), 0);
+}
+
+#[test]
+fn chunk_page_and_chunk_stats_are_independent() {
+    // A tenant's chunk counters and page counters advance on different
+    // APIs and must not interfere.
+    let mut pages = PagePool::new(4096);
+    let mut chunks = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    let _p = pages.allocate(&tenant).seal();
+    let _c = chunks.alloc_from(&tenant, &[0u8; 128]);
+
+    assert_eq!(tenant.stats().pages_in_use(), 1);
+    assert_eq!(tenant.stats().total_pages_allocated(), 1);
+    assert_eq!(tenant.stats().chunks_in_use(), 1);
+    assert_eq!(tenant.stats().total_chunks_allocated(), 1);
+    // bytes_in_use is the sum of both granularities.
+    assert_eq!(tenant.stats().bytes_in_use(), 4096 + 128);
+}
+
+// =========================================================================
+// End ChunkPool tests
+// =========================================================================
 
 #[test]
 fn tenant_clone_shares_stats() {

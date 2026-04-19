@@ -308,6 +308,46 @@ for n in (64, 256, 1024):
     )
 
 # =========================================================================
+# Chunk allocation: three size classes
+# =========================================================================
+title("Chunk allocation  (variable-size bytes on top of fixed-size pages)")
+print(f"  {DIM}16 KiB underlying pages; threshold = 8 KiB{RESET}\n")
+print(f"  {'Path':<11}  {'Size':>10}  {'Time':>12}  {'Throughput':>14}")
+print(f"  {DIM}{'-'*11}  {'-'*10}  {'-'*12}  {'-'*14}{RESET}")
+
+def emit_chunk_row(path, label, size):
+    ns = load("chunk_alloc", path, str(size))
+    if ns is None:
+        return
+    print(f"  {label:<11}  {size:>8} B  {fmt_ns(ns):>12}  {fmt_bytes(ns, size):>14}")
+
+for size in (64, 256, 1024, 4096):
+    emit_chunk_row("packed", "packed", size)
+for size in (10_240, 12_288):
+    emit_chunk_row("dedicated", "dedicated", size)
+for size in (65_536, 262_144):
+    emit_chunk_row("oversized", "oversized", size)
+
+# =========================================================================
+# Chunk vs page overhead
+# =========================================================================
+title("Chunk abstraction overhead vs raw Page  (16 KiB full-page alloc)")
+print()
+print(f"  {'Layer':<18}  {'Time':>12}  {'Throughput':>14}")
+print(f"  {DIM}{'-'*18}  {'-'*12}  {'-'*14}{RESET}")
+page_ns = load("chunk_vs_page_overhead", "page_full_alloc")
+chunk_ns = load("chunk_vs_page_overhead", "chunk_full_alloc")
+if page_ns is not None:
+    print(f"  {'page_full_alloc':<18}  {fmt_ns(page_ns):>12}  {fmt_bytes(page_ns, 16384):>14}")
+if chunk_ns is not None:
+    print(f"  {'chunk_full_alloc':<18}  {fmt_ns(chunk_ns):>12}  {fmt_bytes(chunk_ns, 16384):>14}")
+if page_ns is not None and chunk_ns is not None:
+    overhead = chunk_ns - page_ns
+    pct = (overhead / page_ns) * 100
+    color = GREEN if pct < 50 else YELLOW
+    print(f"\n  {DIM}Chunk overhead:{RESET} {color}{fmt_ns(overhead).strip()} (+{pct:.1f}%){RESET}")
+
+# =========================================================================
 # Cross-thread drop
 # =========================================================================
 title("Cross-thread drop  (page allocated on owner, dropped on N sibling threads)")
