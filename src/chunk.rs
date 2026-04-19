@@ -85,8 +85,6 @@ enum Release {
 /// released to its origin (pool or heap) when the last `Arc` drops.
 struct PackedPage {
     buf: NonNull<u8>,
-    #[allow(dead_code)] // retained for future sanity-checks / debug_assert
-    capacity: usize,
     release: Release,
 }
 
@@ -397,7 +395,6 @@ impl ChunkPool {
         let (buf, pool_shared) = self.pages.allocate_raw_page();
         let packed = Arc::new(PackedPage {
             buf,
-            capacity: self.pages.page_size(),
             release: Release::Pool(pool_shared),
         });
 
@@ -434,7 +431,6 @@ impl ChunkPool {
 
         let packed = Arc::new(PackedPage {
             buf,
-            capacity: size,
             release: Release::Heap(layout),
         });
 
@@ -463,7 +459,6 @@ impl ChunkPool {
         let (buf, pool_shared) = self.pages.allocate_raw_page();
         let packed = Arc::new(PackedPage {
             buf,
-            capacity: self.pages.page_size(),
             release: Release::Pool(pool_shared),
         });
         self.current = Some(OpenPage {
@@ -509,6 +504,9 @@ fn align_up(value: usize, align: usize) -> usize {
 /// the requested bytes; the underlying buffer space is not reclaimed
 /// (it's been claimed on the packed page's cursor, like any bump
 /// allocation).
+#[must_use = "a ChunkBuilder represents a live allocation; call \
+              seal() to publish it, or drop it explicitly to release \
+              the tenant accounting"]
 pub struct ChunkBuilder {
     /// `None` only for zero-size builders.
     packed: Option<Arc<PackedPage>>,
@@ -667,6 +665,8 @@ impl fmt::Debug for ChunkBuilder {
 /// the `Arc<PackedPage>` drops; if that was the last reference to the
 /// underlying buffer, the buffer returns to the pool (or heap, for
 /// oversized).
+#[must_use = "a Chunk holds allocated memory; drop it explicitly to \
+              release, or bind it to use its contents"]
 pub struct Chunk {
     inner: Arc<ChunkInner>,
 }

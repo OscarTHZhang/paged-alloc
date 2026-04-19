@@ -76,6 +76,37 @@ as the global allocator:
 Full tables, methodology, and a reproducible harness in
 `docs/design.md` §10 and `scripts/bench.sh`.
 
+### Recommended global allocator
+
+The hot path does one `Arc::new(ChunkInner)` (or `Arc::new(PageInner)`)
+per `seal`, served from the process-global allocator. Scaling therefore
+depends on that allocator having **per-thread caches**. The numbers
+above assume [mimalloc](https://crates.io/crates/mimalloc) or
+[jemalloc](https://crates.io/crates/tikv-jemallocator). With the
+default system allocator on Linux/macOS (central-arena
+`malloc`), 8-thread aggregate throughput flattens to roughly
+single-thread throughput — this is not a limitation of paged-alloc,
+but of the allocator serving its small internal allocations.
+
+Typical production setup:
+
+```toml
+# in your application's Cargo.toml
+[dependencies]
+mimalloc = { version = "0.1", default-features = false }
+```
+
+```rust
+// in your main.rs
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+```
+
+Every serious Rust database engine (TiKV, Databend, Materialize, etc.)
+ships with jemalloc or mimalloc for the same reason. `paged-alloc`'s
+bench harness already opts in to mimalloc, which is why the reported
+numbers match what a real deployment sees.
+
 ## Getting started
 
 ```bash

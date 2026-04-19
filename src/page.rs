@@ -33,6 +33,8 @@ impl std::error::Error for PageFull {}
 /// builder via [`seal`](Self::seal) produces an immutable [`Page`].
 /// Dropping an unsealed builder returns the buffer to the pool via the
 /// same cross-thread-safe return path that sealed pages use.
+#[must_use = "a PageBuilder represents a live allocation; call seal() \
+              to publish it or drop it explicitly to release"]
 pub struct PageBuilder {
     buf: Option<NonNull<u8>>,
     len: usize,
@@ -170,6 +172,8 @@ impl fmt::Debug for PageBuilder {
 /// last clone drops — on *any* thread — the buffer returns to the
 /// originating pool via a lock-free MPSC return queue, and the
 /// tenant's in-use counters are decremented atomically.
+#[must_use = "a Page holds allocated memory; drop it explicitly to \
+              release, or bind it to use its contents"]
 pub struct Page {
     inner: Arc<PageInner>,
 }

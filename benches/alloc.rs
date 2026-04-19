@@ -102,7 +102,7 @@ fn bench_append(c: &mut Criterion) {
                     while builder.remaining() >= payload.len() {
                         builder.append(black_box(&payload)).unwrap();
                     }
-                    black_box(builder.seal());
+                    drop(black_box(builder.seal()));
                 });
             },
         );

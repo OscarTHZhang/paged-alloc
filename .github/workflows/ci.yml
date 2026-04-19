@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        toolchain: [stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build --all-targets
+      - name: cargo test
+        run: cargo test --all-targets
+      - name: cargo doc-test
+        run: cargo test --doc
+
+  lints:
+    name: lints (clippy + rustdoc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: rustdoc
+        run: cargo doc --no-deps --lib
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  msrv:
+    name: msrv (1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.87"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check on MSRV
+        run: cargo check --all-targets
+
+  examples:
+    name: examples build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release --examples
+        run: cargo build --release --examples
