@@ -307,12 +307,35 @@ impl ChunkPool {
             return self.allocate_zero(tenant);
         }
         let page_size = self.pages.page_size();
-        if size > page_size {
-            self.allocate_oversized(tenant, size, align)
-        } else if size > self.threshold {
-            self.allocate_dedicated(tenant, size)
-        } else {
+
+        // Fast path: for normal alignment (≤ the pool's natural
+        // buffer alignment), the packed and dedicated paths can
+        // honor it because the underlying buffers are already
+        // aligned. Preserve the existing three-class dispatch.
+        if align <= Self::DEFAULT_ALIGN {
+            return if size > page_size {
+                self.allocate_oversized(tenant, size, align)
+            } else if size > self.threshold {
+                self.allocate_dedicated(tenant, size)
+            } else {
+                self.allocate_packed(tenant, size, align)
+            };
+        }
+
+        // Custom alignment path. The packed path can satisfy any
+        // alignment provided the padded allocation fits in a page
+        // (the packed allocator aligns relative to the absolute
+        // buffer address, so there is at most `align - 1` bytes of
+        // padding). The dedicated path cannot satisfy alignment
+        // stricter than the source's natural alignment, so custom
+        // alignment falls back to the oversized path (which
+        // allocates with an explicit Layout honoring `align`).
+        let worst_pad = align - 1;
+        let needed = size.saturating_add(worst_pad);
+        if size <= self.threshold && needed <= page_size {
             self.allocate_packed(tenant, size, align)
+        } else {
+            self.allocate_oversized(tenant, size, align)
         }
     }
 
@@ -427,13 +450,21 @@ impl ChunkPool {
         let page_size = self.pages.page_size();
 
         // Find or open a page that has room for our aligned range.
+        //
+        // We align the *absolute* pointer `buf + offset`, not just the
+        // offset within the buffer, so the returned pointer satisfies
+        // the requested `align` regardless of where the allocator
+        // placed the underlying buffer. This is required when `align`
+        // exceeds the buffer's natural alignment.
         let (shared, offset) = loop {
             if let Some(open) = self.current.as_ref() {
-                let aligned = align_up(open.write_offset, align);
-                if aligned.saturating_add(size) <= page_size {
+                let buf_addr = open.shared.buf.as_ptr() as usize;
+                let aligned_addr = align_up(buf_addr + open.write_offset, align);
+                let aligned_offset = aligned_addr - buf_addr;
+                if aligned_offset.saturating_add(size) <= page_size {
                     let open = self.current.as_mut().unwrap();
-                    open.write_offset = aligned + size;
-                    break (open.shared.clone(), aligned);
+                    open.write_offset = aligned_offset + size;
+                    break (open.shared.clone(), aligned_offset);
                 }
             }
             // Retire the current page (dropping our Arc handle to it —

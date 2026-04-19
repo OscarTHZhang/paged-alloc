@@ -667,19 +667,69 @@ fn chunk_prewarm_avoids_cold_path_for_first_allocs() {
 
 #[test]
 fn chunk_aligned_allocation_pads_packed_offset() {
+    // This test exercises the packed path's alignment handling. The
+    // packed path must align the *absolute* returned pointer, not
+    // just the offset within the buffer — otherwise a buffer whose
+    // address is only 16-byte aligned (the typical `malloc` result)
+    // cannot satisfy e.g. 64-byte alignment via offset alone.
     let mut pool = ChunkPool::with_page_size(16 * 1024);
     let tenant = Tenant::new("t");
 
-    // Start with a 3-byte chunk; cursor becomes 3.
-    let _a = pool.allocate(&tenant, 3).seal();
-    // Request 64-byte-aligned allocation. Cursor advances to 64 first,
-    // wasting 61 bytes, then claims 64 bytes.
-    let mut b = pool.allocate_aligned(&tenant, 64, 64);
-    b.set_len(0);
-    // Check that the buffer pointer we got is 64-aligned.
+    // Consume a few bytes so the cursor is at an odd position.
+    let _warmup = pool.allocate(&tenant, 3).seal();
+
+    // Verify alignment for several strict alignments at offsets the
+    // underlying allocator does not naturally meet. Each `align` is a
+    // power of two stricter than the pool's 8-byte natural alignment.
+    for &align in &[16usize, 32, 64, 128, 256, 512] {
+        let mut b = pool.allocate_aligned(&tenant, align, align);
+        let ptr = b.as_mut_slice().as_mut_ptr() as usize;
+        assert_eq!(
+            ptr % align,
+            0,
+            "alignment {} produced unaligned pointer 0x{:x}",
+            align,
+            ptr,
+        );
+        // Do a tiny write so the allocation is observable.
+        b.as_mut_slice()[0] = align as u8;
+        b.set_len(align);
+        let chunk = b.seal();
+        assert_eq!(chunk.len(), align);
+
+        // Interleave a few bytes of unaligned allocation so the
+        // cursor keeps walking into awkward positions.
+        let _ = pool.alloc_from(&tenant, &[0u8; 7]);
+    }
+}
+
+#[test]
+fn chunk_aligned_allocation_falls_back_to_oversized_when_needed() {
+    // When the requested alignment forces a dedicated-path
+    // allocation (size > threshold) or when the alignment padding
+    // would overflow a page, the allocator must use the oversized
+    // path so the alignment is honored via an explicit Layout.
+    let mut pool = ChunkPool::with_page_size(16 * 1024);
+    let tenant = Tenant::new("t");
+
+    // (1) Size exceeds packing threshold (8 KiB) AND alignment is
+    //     stricter than DEFAULT_ALIGN. Must route to oversized.
+    let mut b = pool.allocate_aligned(&tenant, 10 * 1024, 4096);
     let ptr = b.as_mut_slice().as_mut_ptr() as usize;
-    assert_eq!(ptr % 64, 0, "aligned allocation must be 64-byte aligned");
-    let _ = b.seal();
+    assert_eq!(ptr % 4096, 0);
+    b.set_len(0);
+    let _c = b.seal();
+    assert_eq!(pool.stats().oversized_allocations(), 1);
+    assert_eq!(pool.stats().dedicated_allocations(), 0);
+
+    // (2) Size fits in packed path but padding would overflow the
+    //     page. Must also route to oversized.
+    let mut b = pool.allocate_aligned(&tenant, 64, 16 * 1024);
+    let ptr = b.as_mut_slice().as_mut_ptr() as usize;
+    assert_eq!(ptr % (16 * 1024), 0);
+    b.set_len(0);
+    let _c = b.seal();
+    assert_eq!(pool.stats().oversized_allocations(), 2);
 }
 
 #[test]
